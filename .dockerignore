@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.hf_cache/
+.cache/
+data/
+screen captures/
+tests/__pycache__/
+sam_vit_*.pth
+.env
+.git
+.gitignore
