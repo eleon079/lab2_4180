@@ -17,6 +17,10 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+# ----------------
+# Configuration
+# ----------------
+
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "data/processed"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
@@ -24,6 +28,8 @@ EPOCHS = int(os.getenv("EPOCHS", "20"))
 IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "256"))
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))
 
+
+# Select CPU or GPU from environment settings, with safe fallback
 device_env = os.getenv("DEVICE", "").strip().lower()
 if device_env:
     if device_env.startswith("cuda") and not torch.cuda.is_available():
@@ -39,9 +45,20 @@ ENCODER_NAME = os.getenv("ENCODER_NAME", "resnet34")
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-
+# ----------------
+# Dataset class
+# ----------------
 class HouseSegmentationDataset(Dataset):
+    """
+    Simple dataset wrapper for the processed split folders.
+
+    Expected structure:
+      split/
+        images/
+        masks/
+
+    Each image should have a matching mask with the same filename stem.
+    """
     def __init__(self, root_dir):
         self.root_dir = Path(root_dir)
         self.image_dir = self.root_dir / "images"
@@ -75,8 +92,12 @@ class HouseSegmentationDataset(Dataset):
 
         return image, mask
 
+# ----------------
+# Metrics
+# ----------------
 
 def dice_score(preds, targets, eps=1e-7):
+    # Dice coefficient for binary segmentation.
     preds = preds.view(-1)
     targets = targets.view(-1)
     intersection = (preds * targets).sum()
@@ -84,6 +105,7 @@ def dice_score(preds, targets, eps=1e-7):
 
 
 def iou_score(preds, targets, eps=1e-7):
+    # Intersection over Union (IoU) for binary segmentation.
     preds = preds.view(-1)
     targets = targets.view(-1)
     intersection = (preds * targets).sum()
@@ -92,6 +114,7 @@ def iou_score(preds, targets, eps=1e-7):
 
 
 def evaluate(model, loader, criterion):
+    # Evaluate the model on one dataloader. Returns average: loss, Dice UoU
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
@@ -120,7 +143,12 @@ def evaluate(model, loader, criterion):
     }
 
 
+# ----------------
+# Plot saving
+# ----------------
+
 def save_training_curves(history):
+    # Save the loss curve and validation metric curve to disk.
     epochs = range(1, len(history["train_loss"]) + 1)
 
     plt.figure(figsize=(8, 5))
@@ -147,6 +175,7 @@ def save_training_curves(history):
 
 
 def save_sample_predictions(model, loader, num_samples=3):
+    # Save small grid of input image, ground truth mask and predicted mask (used for report)
     model.eval()
     images, masks = next(iter(loader))
     images = images.to(DEVICE)
@@ -183,8 +212,12 @@ def save_sample_predictions(model, loader, num_samples=3):
     plt.savefig(ARTIFACTS_DIR / "sample_predictions.png")
     plt.close()
 
+# -------------------------------
+# Main (training entry point)
+# -------------------------------
 
 def main():
+    # Load processed dataset splits
     train_ds = HouseSegmentationDataset(DATA_ROOT / "train")
     val_ds = HouseSegmentationDataset(DATA_ROOT / "val")
     test_ds = HouseSegmentationDataset(DATA_ROOT / "test")
@@ -198,6 +231,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
+    # U-Net with a pretrained ResNet34 encoder
     model = smp.Unet(
         encoder_name=ENCODER_NAME,
         encoder_weights="imagenet",
@@ -205,19 +239,13 @@ def main():
         classes=1,
     ).to(DEVICE)
 
-
-
-    # For debugging the lab
-    print("DEVICE =", DEVICE)
-    print("torch.cuda.is_available() =", torch.cuda.is_available())
-    if torch.cuda.is_available():
-        print("GPU =", torch.cuda.get_device_name(0))
-    print("Model device =", next(model.parameters()).device)
-
+    # Loss and optimizer
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     best_val_dice = -math.inf
+
+    # Store curves over time
     history = {
         "train_loss": [],
         "val_loss": [],
@@ -225,6 +253,8 @@ def main():
         "val_iou": [],
     }
 
+    
+    # Training loop
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0.0
@@ -244,6 +274,9 @@ def main():
             batches += 1
 
         train_loss = epoch_loss / max(batches, 1)
+
+
+        # Evaluate on validation set after each epoch
         val_metrics = evaluate(model, val_loader, criterion)
 
         history["train_loss"].append(train_loss)
@@ -259,6 +292,7 @@ def main():
             f"val_iou={val_metrics['iou']:.4f}"
         )
 
+        # Keep the best checkpoint based on validation Dice
         if val_metrics["dice"] > best_val_dice:
             best_val_dice = val_metrics["dice"]
             torch.save(
@@ -271,14 +305,20 @@ def main():
                 ARTIFACTS_DIR / "best_model.pth",
             )
 
+    # Save training curves after training ends
     save_training_curves(history)
 
+    # Reload the best checkpoint before evaluating on the test set
     checkpoint = torch.load(ARTIFACTS_DIR / "best_model.pth", map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
 
+    # Final test-set evaluation
     test_metrics = evaluate(model, test_loader, criterion)
+
+    # Save a small prediction grid for the report
     save_sample_predictions(model, test_loader)
 
+    # Write metrics/config to JSON for easy reporting
     with open(ARTIFACTS_DIR / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(
             {

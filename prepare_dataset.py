@@ -13,6 +13,14 @@ from PIL import Image
 from io import BytesIO
 
 
+# -------------
+# Configuration
+# -------------
+# These settings come from environment variables so the script
+# can run on different machines without hard-coded paths or
+# sensitive values in the source code.
+
+
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "data/processed"))
 HF_DATASET_NAME = os.getenv("HF_DATASET_NAME", "blanchon/INRIA-Aerial-Image-Labeling")
 HF_DATASET_CONFIG = os.getenv("HF_DATASET_CONFIG", "default")
@@ -51,7 +59,21 @@ Path(HF_DATASETS_CACHE).mkdir(parents=True, exist_ok=True)
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 
+# -------------
+# Debug helpers
+# -------------
+
+
 def debug_dataset_sample(train_ds, num_samples=10):
+    """
+    Print the structure of a few raw dataset samples.
+
+    This was useful while debugging because some image/mask fields
+    were not behaving as expected. It helps reveal:
+    - the keys in each dataset item
+    - whether fields are PIL images, dicts, arrays, etc.
+    - filenames/paths when available
+    """
     print("\nDEBUGGING DATASET SAMPLES")
     print("Dataset length:", len(train_ds))
 
@@ -81,6 +103,13 @@ def debug_dataset_sample(train_ds, num_samples=10):
 
 
 def save_debug_raw_samples(train_ds, out_dir="debug_raw", num_samples=10):
+    """
+    Save a few raw dataset samples for manual inspection.
+
+    This is a debugging utility that lets you visually verify:
+    - the raw input images
+    - the raw labels converted to binary masks
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -104,12 +133,23 @@ def save_debug_raw_samples(train_ds, out_dir="debug_raw", num_samples=10):
 
 
 def looks_like_binary_mask(image: Image.Image, unique_limit=8):
+    """
+    Heuristic check: does an image look suspiciously mask-like?
+
+    Useful for catching dataset issues where a supposed RGB image
+    may actually be a nearly binary mask.
+    """
     arr = np.array(image.convert("L"))
     unique_vals = np.unique(arr)
     return len(unique_vals) <= unique_limit
 
 
+# -------------------------
+# Dataset path discovery
+# -------------------------
+
 def find_train_image_root():
+    # Search common cache/project locations for the INRIA RGB image directory.
     candidates = []
 
     for root in [Path(HF_DATASETS_CACHE), Path(HF_HOME), Path(".")]:
@@ -131,8 +171,40 @@ def find_train_image_root():
 
 
 
+def find_train_gt_root():
+    # Search common cache/project locations for the INRIA ground-truth mask directory.
+    candidates = []
+
+    for root in [Path(HF_DATASETS_CACHE), Path(HF_HOME), Path(".")]:
+        if root.exists():
+            candidates.extend(root.rglob("data/train/gt"))
+            candidates.extend(root.rglob("train/gt"))
+
+    candidates = [p for p in candidates if p.is_dir()]
+
+    if not candidates:
+        raise FileNotFoundError(
+            "Could not locate the INRIA training ground-truth folder (train/gt) "
+            "inside the Hugging Face cache or project directory."
+        )
+
+    # Prefer the shortest path / earliest hit
+    candidates = sorted(candidates, key=lambda p: len(str(p)))
+    return candidates[0]
+
+
+# -------------------------
+# Output path helpers
+# -------------------------
 
 def output_paths(output_dir, split_name, idx):
+    """
+    Build matching output paths for one image/mask pair.
+
+    Example:
+      train_00012.png in train/images/
+      train_00012.png in train/masks/
+    """
     img_dir = output_dir / split_name / "images"
     mask_dir = output_dir / split_name / "masks"
     out_name = f"{split_name}_{idx:05d}.png"
@@ -140,6 +212,11 @@ def output_paths(output_dir, split_name, idx):
 
 
 def pair_already_exists(output_dir, split_name, idx):
+    """
+    Check whether a processed image/mask pair already exists and
+    is readable. This prevents unnecessary recomputation unless
+    --force is used.
+    """
     image_path, mask_path = output_paths(output_dir, split_name, idx)
     if not (image_path.is_file() and mask_path.is_file()):
         return False
@@ -154,7 +231,13 @@ def pair_already_exists(output_dir, split_name, idx):
         return False
 
 
+# -------------------------
+# Mask conversion helpers
+# -------------------------
+
+
 def ensure_binary_mask(mask_like):
+    # Convert many possible mask formats into a binary NumPy mask.
     if isinstance(mask_like, Image.Image):
         mask_img = mask_like.convert("L")
 
@@ -184,6 +267,7 @@ def ensure_binary_mask(mask_like):
 
 
 def get_label_mask(item):
+    # Get the label field from a dataset item.
     if "label" in item:
         return item["label"]
 
@@ -192,28 +276,9 @@ def get_label_mask(item):
     )
 
 
-def find_train_gt_root():
-    candidates = []
-
-    for root in [Path(HF_DATASETS_CACHE), Path(HF_HOME), Path(".")]:
-        if root.exists():
-            candidates.extend(root.rglob("data/train/gt"))
-            candidates.extend(root.rglob("train/gt"))
-
-    candidates = [p for p in candidates if p.is_dir()]
-
-    if not candidates:
-        raise FileNotFoundError(
-            "Could not locate the INRIA training ground-truth folder (train/gt) "
-            "inside the Hugging Face cache or project directory."
-        )
-
-    # Prefer the shortest path / earliest hit
-    candidates = sorted(candidates, key=lambda p: len(str(p)))
-    return candidates[0]
-
 
 def get_image_filename(example_image):
+    # Try to recover the original filename from a dataset image object.
     if isinstance(example_image, Image.Image):
         filename = getattr(example_image, "filename", None)
         if filename:
@@ -229,6 +294,7 @@ def get_image_filename(example_image):
 
 
 def get_example_image_and_mask(example, image_root, gt_root):
+    # Given a raw dataset example, recover the matching RGB image and mask path.
     if "image" not in example:
         raise KeyError("Example is missing 'image'.")
 
@@ -252,11 +318,12 @@ def get_example_image_and_mask(example, image_root, gt_root):
     return image, gt_path
 
 
+# --------------------------------------------------
+# Image resizing / bounding box helpers
+# --------------------------------------------------
+
 def resize_image_and_mask(image, binary_mask, max_side):
-    """
-    Downscale large INRIA images before running SAM, then keep track of scale so
-    the final mask can be resized back to original resolution.
-    """
+    # Downscale large images before SAM inference for speed/memory efficiency.
     width, height = image.size
     longest_side = max(width, height)
 
@@ -276,11 +343,7 @@ def resize_image_and_mask(image, binary_mask, max_side):
 
 
 def make_bbox_mask(labelled_bbox, image_shape):
-    """
-    Week 7-style helper:
-    Convert one labelled bounding box into a binary mask.
-    bbox format: [x_min, y_min, width, height]
-    """
+    # Convert one bounding box [x_min, y_min, width, height] into a binary mask.
     height, width = image_shape
     x_min, y_min, box_w, box_h = labelled_bbox
     x_min, y_min, box_w, box_h = int(x_min), int(y_min), int(box_w), int(box_h)
@@ -297,6 +360,7 @@ def make_bbox_mask(labelled_bbox, image_shape):
 
 
 def bbox_union_mask(bboxes, image_shape):
+    # Merge several bounding-box masks into one binary mask.
     final_mask = np.zeros(image_shape, dtype=np.uint8)
     for bbox in bboxes:
         final_mask = np.logical_or(final_mask, make_bbox_mask(bbox, image_shape)).astype(np.uint8)
@@ -304,6 +368,7 @@ def bbox_union_mask(bboxes, image_shape):
 
 
 def iou_score(mask_a, mask_b):
+    # Compute IoU between two binary masks.
     intersection = np.logical_and(mask_a, mask_b).sum()
     union = np.logical_or(mask_a, mask_b).sum()
     if union == 0:
@@ -313,8 +378,11 @@ def iou_score(mask_a, mask_b):
 
 def extract_component_bboxes(binary_mask, min_area):
     """
-    Since INRIA provides pixel masks rather than labelled boxes, derive boxes
-    from connected components, then feed those boxes into the Week 7 SAM flow.
+    Convert connected components in a binary mask into bounding boxes.
+
+    Since INRIA provides pixel masks rather than box annotations, this function
+    creates box prompts from the mask itself so they can be used in the Week 7-
+    style SAM prompting workflow.
     """
     binary_mask = binary_mask.astype(np.uint8)
     height, width = binary_mask.shape
@@ -352,7 +420,13 @@ def extract_component_bboxes(binary_mask, min_area):
     return bboxes
 
 
+# ------------------
+# # SAM helpers
+# ------------------
+
+
 def build_sam_predictor():
+    # Load a SAM model and wrap it in SamPredictor.
     try:
         from segment_anything import SamPredictor, sam_model_registry
     except ImportError as exc:
@@ -378,14 +452,14 @@ def build_sam_predictor():
 
 def generate_week7_box_prompt_mask(image, derived_bboxes, predictor):
     """
-    Adapt Week 7-style SAM box prompting to INRIA:
-    - convert the provided label mask to a binary mask
-    - derive connected-component bounding boxes from the binary mask
-    - optionally downscale the image and mask for faster SAM inference
-    - prompt SAM with each derived bounding box using SamPredictor
-    - union the returned masks into one final binary mask
-    - resize back to original size if needed
-    - intersect with the original binary mask to limit mask leakage
+    Use bounding boxes derived from the label mask to prompt SAM.
+
+    Process:
+    1. Convert image to RGB array
+    2. Set image in SAM
+    3. Run SAM for each box
+    4. Keep the highest-scoring mask from each prompt
+    5. Union all masks into one final result
     """
     image_np = np.array(image.convert("RGB"))
     predictor.set_image(image_np)
@@ -421,12 +495,15 @@ def generate_week7_box_prompt_mask(image, derived_bboxes, predictor):
 
 def generate_inria_week7_sam_mask(image, label_mask, predictor):
     """
-    Adapt Week 7 SAM logic to INRIA:
-    - derive component boxes from the provided pixel labels
-    - optionally downscale for SAM speed
-    - run SAM and keep masks that overlap enough with derived label boxes
-    - resize back to original size
-    - intersect with original binary mask to avoid leaking too far outside labels
+    Full SAM-based mask generation pipeline for INRIA.
+
+    Steps:
+    1. Convert provided label to binary mask
+    2. Optionally downscale image/mask for SAM efficiency
+    3. Extract connected-component boxes from the label mask
+    4. Run SAM using those boxes as prompts
+    5. Intersect result with the original binary mask to reduce leakage
+    6. Resize back to original size if necessary
     """
     binary_mask = ensure_binary_mask(label_mask)
     original_h, original_w = binary_mask.shape
@@ -452,7 +529,18 @@ def generate_inria_week7_sam_mask(image, label_mask, predictor):
     return (final_mask * 255).astype(np.uint8), derived_bboxes
 
 
+
+
+# --------------------------
+# Pair collection / saving
+# --------------------------
+
+
 def collect_labelled_examples(train_ds, image_root, gt_root):
+    """
+    Still useful for inspection, but the final pipeline below uses
+    collect_image_mask_pairs(), which directly scans the image/mask folders.
+    """
     labelled_examples = []
     skipped = 0
 
@@ -492,6 +580,7 @@ def collect_labelled_examples(train_ds, image_root, gt_root):
 
 
 def save_pair(image, mask_array, output_dir, split_name, idx):
+    # Save one RGB image and one binary mask to the correct split folders.
     image_path, mask_path = output_paths(output_dir, split_name, idx)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     mask_path.parent.mkdir(parents=True, exist_ok=True)
@@ -509,6 +598,11 @@ def save_pair(image, mask_array, output_dir, split_name, idx):
 
 
 def collect_image_mask_pairs(image_root, gt_root, max_samples=0):
+    """
+    Final, cleaner pairing strategy:
+    scans the RGB image folder directly and matches each image to a GT mask
+    using the same filename, avoiding relying on possibly ambiguous dataset object fields.
+    """
     image_paths = sorted(
         [p for p in image_root.iterdir() if p.suffix.lower() in {".tif", ".tiff", ".png", ".jpg", ".jpeg"}]
     )
@@ -534,6 +628,9 @@ def collect_image_mask_pairs(image_root, gt_root, max_samples=0):
     print(f"Collected {len(pairs)} valid RGB image / GT mask pairs.")
     return pairs
 
+# --------
+# Main
+# --------
 
 def main():
     parser = argparse.ArgumentParser()

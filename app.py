@@ -13,11 +13,13 @@ load_dotenv()
 
 app = Flask(__name__)
 
+# Configuration
 PORT = int(os.getenv("PORT", "5000"))
 MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/best_model.pth")
 IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "256"))
 THRESHOLD = float(os.getenv("THRESHOLD", "0.5"))
 
+# Decide whether to use CPU or GPU
 device_env = os.getenv("DEVICE", "").strip().lower()
 if device_env:
     if device_env.startswith("cuda") and not torch.cuda.is_available():
@@ -32,7 +34,7 @@ ENCODER_NAME = os.getenv("ENCODER_NAME", "resnet34")
 
 _model = None
 
-
+# Model helpers
 def build_model():
     model = smp.Unet(
         encoder_name=ENCODER_NAME,
@@ -75,7 +77,7 @@ def load_model():
     _model = model
     return _model
 
-
+# Image preprocessing / postprocessing
 def preprocess_image(image: Image.Image):
     image = image.convert("RGB")
     original_w, original_h = image.size
@@ -98,7 +100,7 @@ def image_to_base64_png(img: Image.Image) -> str:
     img.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-
+# Routes
 @app.get("/")
 def home():
     return jsonify(
@@ -172,4 +174,6 @@ def predict():
 
 
 if __name__ == "__main__":
+    # Local development server.
+    # In Docker/production, Waitress is typically used instead.
     app.run(host="0.0.0.0", port=PORT, debug=True)
